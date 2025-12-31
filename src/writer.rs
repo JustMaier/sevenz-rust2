@@ -149,54 +149,118 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// let compressed_size = entry.compressed_size;
     /// sz.finish().expect("done");
     /// ```
-    pub fn push_archive_entry<R: Read>(
+    /// Push an archive entry with optional progress callback.
+    ///
+    /// The callback receives `(compressed_bytes_written_so_far)` after each write to output.
+    /// This tracks actual compressed output progress, which reflects the slow compression work.
+    pub fn push_archive_entry_with_progress<R: Read, F: FnMut(usize)>(
         &mut self,
         mut entry: ArchiveEntry,
         reader: Option<R>,
+        progress: Option<F>,
     ) -> Result<&ArchiveEntry> {
         if !entry.is_directory {
             if let Some(mut r) = reader {
                 let mut compressed_len = 0;
-                let mut compressed = CompressWrapWriter::new(&mut self.output, &mut compressed_len);
 
-                let mut more_sizes: Vec<Rc<Cell<usize>>> =
-                    Vec::with_capacity(self.content_methods.len() - 1);
+                // Create the outer writer with or without progress callback
+                let (crc, size, compressed_crc, more_sizes) = if let Some(cb) = progress {
+                    // Use progress-tracking writer
+                    let mut compressed = CompressWrapWriter::with_progress(
+                        &mut self.output,
+                        &mut compressed_len,
+                        cb,
+                    );
 
-                let (crc, size) = {
-                    let mut w = Self::create_writer(
-                        &self.content_methods,
-                        &mut compressed,
-                        &mut more_sizes,
-                    )?;
-                    let mut write_len = 0;
-                    let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match r.read(&mut buf) {
-                            Ok(n) => {
-                                if n == 0 {
-                                    break;
+                    let mut more_sizes: Vec<Rc<Cell<usize>>> =
+                        Vec::with_capacity(self.content_methods.len() - 1);
+
+                    let (crc, size) = {
+                        let mut w = Self::create_writer(
+                            &self.content_methods,
+                            &mut compressed,
+                            &mut more_sizes,
+                        )?;
+                        let mut write_len = 0;
+                        let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match r.read(&mut buf) {
+                                Ok(n) => {
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    w.write_all(&buf[..n]).map_err(|e| {
+                                        Error::io_msg(e, format!("Encode entry:{}", entry.name()))
+                                    })?;
                                 }
-                                w.write_all(&buf[..n]).map_err(|e| {
-                                    Error::io_msg(e, format!("Encode entry:{}", entry.name()))
-                                })?;
-                            }
-                            Err(e) => {
-                                return Err(Error::io_msg(
-                                    e,
-                                    format!("Encode entry:{}", entry.name()),
-                                ));
+                                Err(e) => {
+                                    return Err(Error::io_msg(
+                                        e,
+                                        format!("Encode entry:{}", entry.name()),
+                                    ));
+                                }
                             }
                         }
-                    }
-                    w.flush()
-                        .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
-                    w.write(&[])
-                        .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+                        w.flush()
+                            .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+                        w.write(&[])
+                            .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
 
-                    (w.crc_value(), write_len)
+                        let crc_val = w.crc_value();
+                        drop(w);
+                        (crc_val, write_len)
+                    };
+                    let compressed_crc = compressed.crc_value();
+                    drop(compressed);
+                    (crc, size, compressed_crc, more_sizes)
+                } else {
+                    // No progress tracking - use simple writer
+                    let mut compressed = CompressWrapWriter::new(&mut self.output, &mut compressed_len);
+
+                    let mut more_sizes: Vec<Rc<Cell<usize>>> =
+                        Vec::with_capacity(self.content_methods.len() - 1);
+
+                    let (crc, size) = {
+                        let mut w = Self::create_writer(
+                            &self.content_methods,
+                            &mut compressed,
+                            &mut more_sizes,
+                        )?;
+                        let mut write_len = 0;
+                        let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match r.read(&mut buf) {
+                                Ok(n) => {
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    w.write_all(&buf[..n]).map_err(|e| {
+                                        Error::io_msg(e, format!("Encode entry:{}", entry.name()))
+                                    })?;
+                                }
+                                Err(e) => {
+                                    return Err(Error::io_msg(
+                                        e,
+                                        format!("Encode entry:{}", entry.name()),
+                                    ));
+                                }
+                            }
+                        }
+                        w.flush()
+                            .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+                        w.write(&[])
+                            .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+
+                        let crc_val = w.crc_value();
+                        drop(w);
+                        (crc_val, write_len)
+                    };
+                    let compressed_crc = compressed.crc_value();
+                    drop(compressed);
+                    (crc, size, compressed_crc, more_sizes)
                 };
-                let compressed_crc = compressed.crc_value();
                 entry.has_stream = true;
                 entry.size = size as u64;
                 entry.crc = crc as u64;
@@ -223,6 +287,15 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entry.has_crc = false;
         self.files.push(entry);
         Ok(self.files.last().unwrap())
+    }
+
+    /// Push an archive entry without progress tracking (backwards compatible).
+    pub fn push_archive_entry<R: Read>(
+        &mut self,
+        entry: ArchiveEntry,
+        reader: Option<R>,
+    ) -> Result<&ArchiveEntry> {
+        self.push_archive_entry_with_progress(entry, reader, None::<fn(usize)>)
     }
 
     /// Solid compression - packs `entries` into one pack.
@@ -293,9 +366,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 Error::io_msg(e, format!("Encode entry:{}", entries_names(&entries)))
             })?;
 
-            (w.crc_value(), write_len)
+            let crc_val = w.crc_value();
+            drop(w); // Explicitly drop to release borrow
+            (crc_val, write_len)
         };
         let compressed_crc = compressed.crc_value();
+        drop(compressed); // Explicitly drop to release borrow
         let mut sub_stream_crcs = Vec::with_capacity(entries.len());
         let mut sub_stream_sizes = Vec::with_capacity(entries.len());
         for i in 0..entries.len() {
@@ -638,6 +714,7 @@ struct CompressWrapWriter<'a, W> {
     crc: Hasher,
     cache: Vec<u8>,
     bytes_written: &'a mut usize,
+    progress_callback: Option<Box<dyn FnMut(usize) + 'a>>,
 }
 
 impl<'a, W: Write> CompressWrapWriter<'a, W> {
@@ -647,6 +724,17 @@ impl<'a, W: Write> CompressWrapWriter<'a, W> {
             crc: Hasher::new(),
             cache: Vec::with_capacity(8192),
             bytes_written,
+            progress_callback: None,
+        }
+    }
+
+    pub fn with_progress<F: FnMut(usize) + 'a>(writer: W, bytes_written: &'a mut usize, callback: F) -> Self {
+        Self {
+            writer,
+            crc: Hasher::new(),
+            cache: Vec::with_capacity(8192),
+            bytes_written,
+            progress_callback: Some(Box::new(callback)),
         }
     }
 
@@ -662,6 +750,9 @@ impl<W: Write> Write for CompressWrapWriter<'_, W> {
         let len = self.writer.write(buf)?;
         self.crc.update(&buf[..len]);
         *self.bytes_written += len;
+        if let Some(ref mut cb) = self.progress_callback {
+            cb(*self.bytes_written);
+        }
         Ok(len)
     }
 
